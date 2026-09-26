@@ -1,4 +1,4 @@
-const VERSION = '8';
+const VERSION = '9';
 
 class UnifiEventsCard extends HTMLElement {
   constructor() {
@@ -32,12 +32,12 @@ class UnifiEventsCard extends HTMLElement {
 
   _typeIcon(type) {
     const icons = {
-      person: '<svg viewBox="0 0 24 24" fill="#555"><circle cx="12" cy="7" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>',
-      vehicle: '<svg viewBox="0 0 24 24" fill="#555"><rect x="2" y="10" width="20" height="8" rx="2"/><path d="M5 10l3-5h8l3 5"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/></svg>',
-      animal: '<svg viewBox="0 0 24 24" fill="#555"><ellipse cx="12" cy="13" rx="5" ry="4"/><circle cx="7" cy="8" r="2"/><circle cx="17" cy="8" r="2"/><circle cx="5" cy="13" r="1.5"/><circle cx="19" cy="13" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>',
-      package: '<svg viewBox="0 0 24 24" fill="#555"><rect x="3" y="8" width="18" height="13" rx="1"/><path d="M3 8l3-5h12l3 5"/><line x1="12" y1="8" x2="12" y2="21" stroke="#333" stroke-width="1.5"/></svg>',
+      person: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="7" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/></svg>',
+      vehicle: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="2" y="10" width="20" height="8" rx="2"/><path d="M5 10l3-5h8l3 5"/><circle cx="7" cy="18" r="2"/><circle cx="17" cy="18" r="2"/></svg>',
+      animal: '<svg viewBox="0 0 24 24" fill="currentColor"><ellipse cx="12" cy="13" rx="5" ry="4"/><circle cx="7" cy="8" r="2"/><circle cx="17" cy="8" r="2"/><circle cx="5" cy="13" r="1.5"/><circle cx="19" cy="13" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>',
+      package: '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="3" y="8" width="18" height="13" rx="1"/><path d="M3 8l3-5h12l3 5"/><line x1="12" y1="8" x2="12" y2="21" stroke="#333" stroke-width="1.5"/></svg>',
     };
-    return icons[type] || '<svg viewBox="0 0 24 24" fill="#555"><circle cx="12" cy="12" r="9"/></svg>';
+    return icons[type] || '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="9"/></svg>';
   }
 
   _fuzzyAge(isoTs) {
@@ -111,6 +111,7 @@ class UnifiEventsCard extends HTMLElement {
           align-items: center;
           justify-content: center;
           background: #1a1a1a;
+          color: #555;
         }
 
         .placeholder svg {
@@ -122,6 +123,7 @@ class UnifiEventsCard extends HTMLElement {
           position: absolute;
           bottom: 6px;
           left: 6px;
+          white-space: nowrap;   /* narrow cells would otherwise break the pill in two */
           background: rgba(0, 0, 0, 0.65);
           color: #fff;
           font-size: 13px;
@@ -129,6 +131,13 @@ class UnifiEventsCard extends HTMLElement {
           padding: 2px 6px;
           border-radius: 4px;
           pointer-events: none;
+        }
+
+        .cell .label svg {
+          width: 13px;
+          height: 13px;
+          vertical-align: -2px;
+          margin-right: 4px;
         }
 
         /* Lightbox only: a second pill in the opposite corner with the wall-clock time. */
@@ -253,7 +262,8 @@ class UnifiEventsCard extends HTMLElement {
     }
     grid.appendChild(el);
 
-    const cell = { el, img, placeholder, label, timeLabel, showAbs, url: null, ts: null, type: null, retries: 0, failed: false };
+    const cell = { el, img, placeholder, label, timeLabel, showAbs, url: null, ts: null,
+                   type: null, showType: false, retries: 0, failed: false };
     img.addEventListener('load', () => this._onImgLoad(cell));
     img.addEventListener('error', () => this._onImgError(cell));
     return cell;
@@ -294,6 +304,7 @@ class UnifiEventsCard extends HTMLElement {
       cell.url = null;
       cell.ts = null;
       cell.type = null;
+      cell.showType = false;
       cell.img.removeAttribute('src');
       cell.img.style.display = 'none';
       cell.placeholder.style.display = 'none';
@@ -303,6 +314,8 @@ class UnifiEventsCard extends HTMLElement {
 
     cell.ts = thumb.ts;
     cell.type = thumb.type;
+    // Not the final crop yet: spell the type out.
+    cell.showType = !!(thumb.provisional || thumb.pending);
     this._renderLabel(cell);
 
     if (!thumb.url) {
@@ -372,7 +385,17 @@ class UnifiEventsCard extends HTMLElement {
       return;
     }
     cell.label.style.display = '';
-    cell.label.textContent = this._fuzzyAge(cell.ts);
+    // The icon is always shown: even a final crop can be ambiguous (a distant car, a
+    // grainy animal at night). The type word appears only while the image isn't the
+    // final crop yet, which is exactly when the wide uncropped frame is hard to read.
+    cell.label.innerHTML = this._typeIcon(cell.type);
+    if (cell.showType) {
+      const type = document.createElement('span');
+      type.className = 'type';
+      type.textContent = `${cell.type || 'event'} · `;
+      cell.label.appendChild(type);
+    }
+    cell.label.append(this._fuzzyAge(cell.ts));
     if (cell.timeLabel) {
       cell.timeLabel.style.display = '';
       cell.timeLabel.textContent = this._absTime(cell.ts);
