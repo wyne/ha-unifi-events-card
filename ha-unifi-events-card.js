@@ -1,12 +1,17 @@
-const VERSION = '5';
+const VERSION = '8';
 
 class UnifiEventsCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
     this._interval = null;
-    this._cells = [];   // [{img, label}] — built once, patched on each fetch
-    this._urls = [];   // current img URLs, used to diff on next fetch
+    this._ageTimer = null;
+    this._fetchSeq = 0;
+    this._cells = [];          // [{img, placeholder, label, ...}] — built once, patched on each fetch
+    this._lightboxCells = [];
+    this._onKeyDown = (e) => {
+      if (e.key === 'Escape') this._closeLightbox();
+    };
   }
 
   setConfig(config) {
@@ -47,11 +52,23 @@ class UnifiEventsCard extends HTMLElement {
     return `${Math.floor(days / 7)} w`;
   }
 
+  // Wall-clock stamp for the lightbox pill, e.g. "Tue - 1:11 PM". Anything older
+  // than a week gets a date instead of a weekday, which would be ambiguous.
+  // hour12 is pinned so the pill stays 12-hour regardless of browser locale.
+  _absTime(isoTs) {
+    const d = new Date(isoTs);
+    if (isNaN(d)) return '';
+    const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', hour12: true });
+    const day = (Date.now() - d) < 7 * 86400000
+      ? d.toLocaleDateString([], { weekday: 'short' })
+      : d.toLocaleDateString([], { month: 'numeric', day: 'numeric' });
+    return `${day} - ${time}`;
+  }
+
   _build() {
     const cols = this._config.cols || 3;
     const count = this._config.count || 3;
     const lightboxCount = this._config.lightbox_count || 6;
-    const refreshInterval = (this._config.refresh_interval || 300) * 1000;
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -112,6 +129,12 @@ class UnifiEventsCard extends HTMLElement {
           padding: 2px 6px;
           border-radius: 4px;
           pointer-events: none;
+        }
+
+        /* Lightbox only: a second pill in the opposite corner with the wall-clock time. */
+        .cell .label.time {
+          left: auto;
+          right: 6px;
         }
 
         .lightbox {
@@ -193,111 +216,204 @@ class UnifiEventsCard extends HTMLElement {
     const rows = Math.ceil(lightboxCount / cols);
     lightboxInner.style.width = `min(95vw, calc(95vh * ${cols} / ${rows}))`;
 
-    // Pre-build empty cells for the main grid
+    // Pre-build empty cells. The lightbox is roomier, so its labels also carry
+    // the wall-clock time alongside the relative age.
     this._cells = [];
-    for (let i = 0; i < count; i++) {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      const img = document.createElement('img');
-      img.decoding = 'async';
-      const placeholder = document.createElement('div');
-      placeholder.className = 'placeholder';
-      const label = document.createElement('span');
-      label.className = 'label';
-      cell.appendChild(img);
-      cell.appendChild(placeholder);
-      cell.appendChild(label);
-      grid.appendChild(cell);
-      this._cells.push({ img, placeholder, label });
-    }
+    for (let i = 0; i < count; i++) this._cells.push(this._makeCell(grid, false));
 
-    // Pre-build empty cells for the lightbox grid
     this._lightboxCells = [];
-    for (let i = 0; i < lightboxCount; i++) {
-      const cell = document.createElement('div');
-      cell.className = 'cell';
-      const img = document.createElement('img');
-      img.decoding = 'async';
-      const placeholder = document.createElement('div');
-      placeholder.className = 'placeholder';
-      const label = document.createElement('span');
-      label.className = 'label';
-      cell.appendChild(img);
-      cell.appendChild(placeholder);
-      cell.appendChild(label);
-      lightboxGrid.appendChild(cell);
-      this._lightboxCells.push({ img, placeholder, label });
-    }
+    for (let i = 0; i < lightboxCount; i++) this._lightboxCells.push(this._makeCell(lightboxGrid, true));
 
     // Lightbox open/close
     card.addEventListener('click', () => lightbox.classList.add('open'));
-    lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
-    closeBtn.addEventListener('click', () => lightbox.classList.remove('open'));
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') lightbox.classList.remove('open');
-    });
+    lightbox.addEventListener('click', () => this._closeLightbox());
+    closeBtn.addEventListener('click', () => this._closeLightbox());
 
-    // Initial fetch + start interval
     this._fetchAndUpdate('initial');
-    if (this._interval) clearInterval(this._interval);
-    this._interval = setInterval(() => this._fetchAndUpdate('interval'), refreshInterval);
+    if (this.isConnected) this._startTimers();
+  }
+
+  _makeCell(grid, showAbs) {
+    const el = document.createElement('div');
+    el.className = 'cell';
+    const img = document.createElement('img');
+    img.decoding = 'async';
+    const placeholder = document.createElement('div');
+    placeholder.className = 'placeholder';
+    const label = document.createElement('span');
+    label.className = 'label';
+    el.appendChild(img);
+    el.appendChild(placeholder);
+    el.appendChild(label);
+    let timeLabel = null;
+    if (showAbs) {
+      timeLabel = document.createElement('span');
+      timeLabel.className = 'label time';
+      el.appendChild(timeLabel);
+    }
+    grid.appendChild(el);
+
+    const cell = { el, img, placeholder, label, timeLabel, showAbs, url: null, ts: null, type: null, retries: 0, failed: false };
+    img.addEventListener('load', () => this._onImgLoad(cell));
+    img.addEventListener('error', () => this._onImgError(cell));
+    return cell;
+  }
+
+  _closeLightbox() {
+    this.shadowRoot.getElementById('lightbox')?.classList.remove('open');
   }
 
   _fetchAndUpdate(reason = 'interval') {
     const count = this._config.count || 3;
     const lightboxCount = this._config.lightbox_count || 6;
     const url = this._config.url;
+    const seq = ++this._fetchSeq;
 
-    console.debug(`[rtp-card] fetching (${reason})`, url);
+    console.debug(`[unifi-events-card] fetching (${reason})`, url);
     fetch(`${url}?_t=${Date.now()}`, { cache: 'no-store' })
       .then(r => r.json())
       .then(data => {
+        // Ignore a slow response that a newer fetch has already superseded.
+        if (seq !== this._fetchSeq) return;
         const thumbs = data.thumbnails || [];
         this._patch(this._cells, thumbs.slice(0, count).reverse());
         this._patch(this._lightboxCells, thumbs.slice(0, lightboxCount).reverse());
       })
-      .catch(() => { /* ignore fetch errors — stale display is fine */ });
+      .catch((err) => console.debug('[unifi-events-card] fetch failed', err));
   }
 
   _patch(cells, thumbs) {
-    cells.forEach((cell, i) => {
-      const thumb = thumbs[i];
-      if (!thumb) {
-        cell.img.removeAttribute('src');
-        cell.label.textContent = '';
-        return;
-      }
-      if (!thumb.url) {
-        cell.img.removeAttribute('src');
-        cell.img.style.display = 'none';
-        cell.placeholder.innerHTML = this._typeIcon(thumb.type);
-        cell.placeholder.style.display = 'flex';
-      } else {
-        cell.placeholder.style.display = 'none';
-        cell.img.style.display = 'block';
-        // Only update src if URL changed — avoids unnecessary decode
-        if (cell.img.getAttribute('src') !== thumb.url) {
-          cell.img.setAttribute('src', thumb.url);
-        }
-      }
-      cell.label.textContent = this._fuzzyAge(thumb.ts);
-      cell.label.dataset.ts = thumb.ts;
-    });
+    // Newest goes last. When there are fewer entries than cells, leave the gap at
+    // the start so the newest keeps the final slot instead of drifting mid-grid.
+    const offset = cells.length - thumbs.length;
+    cells.forEach((cell, i) => this._applyThumb(cell, thumbs[i - offset]));
   }
 
-  connectedCallback() {
-    // Restart the interval if the element is reconnected to the DOM after
-    // being removed (HA does this during rendering and view navigation).
-    if (this._config && !this._interval) {
-      const refreshInterval = (this._config.refresh_interval || 30) * 1000;
-      this._fetchAndUpdate();
-      this._interval = setInterval(() => this._fetchAndUpdate(), refreshInterval);
+  _applyThumb(cell, thumb) {
+    if (!thumb) {
+      cell.url = null;
+      cell.ts = null;
+      cell.type = null;
+      cell.img.removeAttribute('src');
+      cell.img.style.display = 'none';
+      cell.placeholder.style.display = 'none';
+      this._renderLabel(cell);
+      return;
+    }
+
+    cell.ts = thumb.ts;
+    cell.type = thumb.type;
+    this._renderLabel(cell);
+
+    if (!thumb.url) {
+      // Detection seen, thumbnail not generated yet — hold the slot with a typed icon.
+      cell.url = null;
+      cell.img.removeAttribute('src');
+      this._showPlaceholder(cell);
+      return;
+    }
+
+    if (cell.url !== thumb.url) {
+      cell.url = thumb.url;
+      cell.retries = 0;
+      cell.failed = false;
+      // Leave the old image on screen until the new one decodes, to avoid a flash.
+      cell.img.src = thumb.url;
+    } else if (cell.failed) {
+      this._retry(cell);   // same URL as before but it never loaded — try again
     }
   }
 
-  disconnectedCallback() {
+  _showPlaceholder(cell) {
+    cell.placeholder.innerHTML = this._typeIcon(cell.type);
+    cell.placeholder.style.display = 'flex';
+    cell.img.style.display = 'none';
+  }
+
+  _onImgLoad(cell) {
+    cell.failed = false;
+    cell.retries = 0;
+    cell.placeholder.style.display = 'none';
+    cell.img.style.display = 'block';
+  }
+
+  _onImgError(cell) {
+    if (!cell.url) return;
+    cell.failed = true;
+    this._showPlaceholder(cell);   // a typed icon beats a broken-image glyph
+    if (cell.retries >= 4) {
+      console.warn('[unifi-events-card] giving up on', cell.url);
+      return;
+    }
+    const url = cell.url;
+    const delay = 1000 * Math.pow(2, cell.retries);
+    setTimeout(() => {
+      if (cell.url === url) this._retry(cell);
+    }, delay);
+  }
+
+  _retry(cell) {
+    if (!cell.url || cell.retries >= 8) return;
+    cell.retries += 1;
+    // /local is served with a month-long cache header, so a retry needs a fresh
+    // URL or the browser just replays the failed/truncated response.
+    const sep = cell.url.includes('?') ? '&' : '?';
+    cell.img.src = `${cell.url}${sep}_retry=${cell.retries}`;
+  }
+
+  _renderLabel(cell) {
+    if (!cell.ts) {
+      cell.label.textContent = '';
+      cell.label.style.display = 'none';   // otherwise an empty cell shows a bare chip
+      if (cell.timeLabel) {
+        cell.timeLabel.textContent = '';
+        cell.timeLabel.style.display = 'none';
+      }
+      return;
+    }
+    cell.label.style.display = '';
+    cell.label.textContent = this._fuzzyAge(cell.ts);
+    if (cell.timeLabel) {
+      cell.timeLabel.style.display = '';
+      cell.timeLabel.textContent = this._absTime(cell.ts);
+    }
+  }
+
+  // Ages are rendered at fetch time, so without this a label reads "now" until the
+  // next fetch — which can be minutes.
+  _refreshLabels() {
+    [...this._cells, ...this._lightboxCells].forEach((cell) => this._renderLabel(cell));
+  }
+
+  _startTimers() {
+    const refreshInterval = (this._config.refresh_interval || 300) * 1000;
+    if (!this._interval) {
+      this._interval = setInterval(() => this._fetchAndUpdate('interval'), refreshInterval);
+    }
+    if (!this._ageTimer) {
+      this._ageTimer = setInterval(() => this._refreshLabels(), 30000);
+    }
+  }
+
+  _stopTimers() {
     if (this._interval) clearInterval(this._interval);
     this._interval = null;
+    if (this._ageTimer) clearInterval(this._ageTimer);
+    this._ageTimer = null;
+  }
+
+  connectedCallback() {
+    // HA moves cards in and out of the DOM while rendering and navigating, which
+    // kills the timers — restart them (and refresh) whenever we come back.
+    if (!this._config) return;
+    document.addEventListener('keydown', this._onKeyDown);
+    this._fetchAndUpdate('connected');
+    this._startTimers();
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener('keydown', this._onKeyDown);
+    this._stopTimers();
   }
 
   getCardSize() {

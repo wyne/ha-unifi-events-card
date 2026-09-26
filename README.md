@@ -47,7 +47,7 @@ refresh_interval: 300
 | `url`              | —       | Path to `recent.json` produced by the AppDaemon app (required)                                            |
 | `entity`           | —       | HA entity ID updated by AppDaemon on new detections; triggers instant card refresh with zero idle polling |
 | `count`            | `3`     | Thumbnails shown in the card grid                                                                         |
-| `lightbox_count`   | `6`     | Thumbnails shown when the card is tapped                                                                  |
+| `lightbox_count`   | `6`     | Thumbnails shown when the card is tapped; these labels also show the wall-clock time                      |
 | `cols`             | `3`     | Columns per row in both the grid and lightbox                                                             |
 | `refresh_interval` | `300`   | Fallback polling interval in seconds (only active if `entity` is not set or as a safety net)              |
 
@@ -64,13 +64,13 @@ cd apps/recent_detections
 python3 recent_detections.py --count 6
 ```
 
-This writes thumbnails and `output/recent.json` relative to that repo's root.
+This writes thumbnails and `output/recent.json` next to the script, in `apps/recent_detections/`.
 
 **2. Symlink or copy the output**
 
 ```bash
-# From ha-unifi-events-card repo root
-ln -s /path/to/ha-unifi-events/output output
+# From ha-unifi-events-card repo root (the CLI writes output/ next to the script)
+ln -s /path/to/ha-unifi-events/apps/recent_detections/output output
 ```
 
 **3. Serve and open**
